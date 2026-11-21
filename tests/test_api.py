@@ -114,3 +114,62 @@ class TestApiErrors:
 
     def test_remove_before_import_400(self, client):
         assert client.post("/api/remove/x").status_code == 400
+
+
+class TestCorruptionApi:
+    def _setup(self, client):
+        resp = client.post("/api/demo/corrupt")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def test_demo_endpoint_creates_corrupt_blocks(self, client):
+        st = self._setup(client)
+        by_id = {l["id"]: l for l in st["layers"]}
+        assert by_id["base"]["corrupt_blocks"] == [1]
+        assert by_id["mid"]["corrupt_blocks"] == [2, 4]
+        assert by_id["mid"]["can_remove"] is False
+        assert "mid" in by_id["mid"]["remove_blocked_reason"]
+        assert "4" in by_id["mid"]["remove_blocked_reason"]
+
+    def test_download_needing_bad_block_returns_400_with_source(self, client):
+        self._setup(client)
+        resp = client.get("/api/download/right")  # right 需继承 mid 的坏块4
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "mid" in detail and "块 4" in detail
+
+    def test_download_own_bad_block_400(self, client):
+        self._setup(client)
+        resp = client.get("/api/download/base")
+        assert resp.status_code == 400
+        assert "base" in resp.json()["detail"] and "块 1" in resp.json()["detail"]
+
+    def test_download_covered_restore_point_200_full_size(self, client):
+        st = self._setup(client)
+        resp = client.get("/api/download/leaf")
+        assert resp.status_code == 200
+        assert len(resp.content) == st["disk_size"]  # 完整镜像，不是短镜像
+
+    def test_remove_inheriting_bad_block_400_and_tree_intact(self, client):
+        self._setup(client)
+        resp = client.post("/api/remove/mid")
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "mid" in detail and "块 4" in detail
+        # 快照树保持原样
+        st = client.get("/api/state").json()
+        assert {l["id"] for l in st["layers"]} == {
+            "base", "mid", "left", "leaf", "right"}
+
+    def test_remove_clean_snapshot_succeeds_amid_corruption(self, client):
+        self._setup(client)
+        before = client.get("/api/download/leaf").content
+        resp = client.post("/api/remove/left")
+        assert resp.status_code == 200
+        assert client.get("/api/download/leaf").content == before  # 逐字节一致
+
+    def test_import_still_rejects_bad_base64(self, client):
+        # 导入路径的严格校验不放松
+        bad = make_manifest(layers=[{"id": "a", "parent": None,
+                                     "blocks": {"0": "not-base64!!"}}])
+        assert client.post("/api/import", json=bad).status_code == 400

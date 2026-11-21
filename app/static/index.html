@@ -29,6 +29,11 @@
   .ok { color: #2e9e4f; } .err { color: #d64545; }
   #recovery { border-color: #d6a445; } #recovery li { color: #b9832a; }
   .hint { color: #888; font-size: .85rem; }
+  .corrupt { color: #d64545; font-weight: 600; }
+  .tag.bad { border-color: #d64545; color: #d64545; }
+  .tag.warn { border-color: #b9832a; color: #b9832a; }
+  .why { display: block; color: #d64545; font-size: .8rem; margin: 3px 0 1px; }
+  .dl-ok { color: #2e9e4f; font-size: .82rem; }
 </style>
 </head>
 <body>
@@ -48,15 +53,19 @@
   <p class="hint">清单包含基盘与可分叉的增量快照；盘块 4 KiB、Base64 编码；单盘 ≤ 16 MiB；每层在卷上各存一个文件。导入会整体替换现有数据。</p>
   <p>
     <input type="file" id="file" accept=".json,application/json">
-    <button class="ghost" id="loadSample">载入示例清单</button>
+    <button class="ghost"</doubaothinking_never_used_51bce0c785ca2f68081bfa7d91973934>="loadSample">载入示例清单</button>
+    <button class="ghost" id="loadCorruptDemo">载入坏块演示场景</button>
     <button id="doImport">导入</button>
   </p>
+  <p class="hint">「坏块演示场景」会先合法导入一份清单，再篡改卷上层文件制造静置损坏：
+    base 块1 为短块（解码后不足 4 KiB），mid 块2 为短块、块4 为非法 Base64。</p>
   <textarea id="manifestText" rows="9" placeholder='{"disk_size": 1048576, "layers": [{"id":"base","parent":null,"blocks":{"0":"..."}}, ...]}'></textarea>
 </section>
 
 <section>
   <h2>2. 快照链</h2>
-  <p class="hint">“撤除”会删除该快照并把其块合并进直接子层（缺块才继承，全零块算改写），其余层不动；任一快照都可下载还原后的原始镜像。</p>
+  <p class="hint">“撤除”会删除该快照并把其块合并进直接子层（缺块才继承，全零块算改写），其余层不动；任一快照都可下载还原后的原始镜像。<br>
+  坏块规则：下载时若恢复点需要读取坏块（Base64 非法或解码后不是 4 KiB）且无下层自有块覆盖（显式全零块也算覆盖），直接拒绝，绝不用祖先块补齐；撤除含坏块的中间快照时，只要有一个直接子层会继承坏块就整次拒绝，快照树与层文件保持原样。</p>
   <div id="tree">尚未导入清单。</div>
 </section>
 
@@ -122,22 +131,52 @@ function renderTree(st) {
 
   function nodeHtml(l) {
     const kids = l.children.map(cid => nodeHtml(byId[cid])).join("");
-    const removeBtn = l.can_remove
-      ? `<button data-remove="${l.id}">撤除</button>`
-      : `<button disabled title="${l.parent === null ? "基盘（根层）不能撤除" : "没有子层，不可撤除"}">撤除</button>`;
+    const corrupt = (l.corrupt_blocks || []).length
+      ? `<span class="tag bad" title="该层层文件中的坏盘块（Base64 非法或解码后不是 4 KiB）">坏块 ${l.corrupt_blocks.join(", ")}</span>`
+      : "";
+    const unreadable = l.unreadable
+      ? `<span class="tag bad" title="${l.unreadable}">层文件不可读</span>` : "";
+    const why = l.remove_blocked_reason
+      ? `<span class="why">撤除被拒：${l.remove_blocked_reason}</span>` : "";
+    let removeBtn;
+    if (l.can_remove) {
+      removeBtn = `<button data-remove="${l.id}">撤除</button>`;
+    } else if (l.parent === null) {
+      removeBtn = `<button disabled title="基盘（根层）不能撤除">撤除</button>`;
+    } else if (!l.children.length) {
+      removeBtn = `<button disabled title="没有子层，不可撤除">撤除</button>`;
+    } else {
+      removeBtn = `<button disabled title="${l.remove_blocked_reason || "含坏块，撤除被拒"}">撤除</button>`;
+    }
     return `<li><b>${l.id}</b><span class="meta">${l.block_count} 块</span>
       <button class="ghost" data-download="${l.id}">下载镜像</button>
       ${removeBtn}
       ${l.parent === null ? '<span class="tag">基盘</span>' : ""}
+      ${corrupt}${unreadable}${why}
       ${kids ? `<ul>${kids}</ul>` : ""}</li>`;
   }
   host.innerHTML = `<ul class="tree">${roots.map(nodeHtml).join("")}</ul>`;
 
   host.querySelectorAll("[data-download]").forEach(btn =>
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const id = btn.getAttribute("data-download");
-      log(`开始下载 ${id}.raw …`);
-      window.location = `/api/download/${encodeURIComponent(id)}`;
+      log(`请求下载 ${id}.raw …`);
+      try {
+        const resp = await fetch(`/api/download/${encodeURIComponent(id)}`);
+        if (!resp.ok) {
+          let detail = `${resp.status}`;
+          try { detail = (await resp.json()).detail || detail; } catch (_) {}
+          log(`下载被拒：${detail}`, true);
+          return;
+        }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `${id}.raw`;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        log(`已下载 ${id}.raw（${blob.size} 字节，长度与盘大小一致）`);
+      } catch (e) { log(`下载失败：${e.message}`, true); }
     }));
   host.querySelectorAll("[data-remove]").forEach(btn =>
     btn.addEventListener("click", async () => {
@@ -147,7 +186,10 @@ function renderTree(st) {
         const st2 = await api(`/api/remove/${encodeURIComponent(id)}`, { method: "POST" });
         log(st2.message || `已撤除 ${id}`);
         await refresh();
-      } catch (e) { log(`撤除失败：${e.message}`, true); }
+      } catch (e) {
+        log(`撤除失败：${e.message}；快照树与层文件保持原样`, true);
+        await refresh();
+      }
     }));
 }
 
@@ -157,6 +199,15 @@ $("loadSample").addEventListener("click", async () => {
     $("manifestText").value = JSON.stringify(sample, null, 1);
     log("已载入示例清单，点击“导入”生效。");
   } catch (e) { log(`获取示例失败：${e.message}`, true); }
+});
+
+$("loadCorruptDemo").addEventListener("click", async () => {
+  try {
+    const st = await api("/api/demo/corrupt", { method: "POST" });
+    $("manifestText").value = "(坏块演示场景已由服务端直接导入并注入损坏，无需再点导入)";
+    log(st.message || "坏块演示场景已就绪");
+    await refresh();
+  } catch (e) { log(`搭建坏块演示场景失败：${e.message}`, true); }
 });
 
 $("file").addEventListener("change", () => {
